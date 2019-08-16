@@ -1,3 +1,5 @@
+#sensBVP
+
 This is the public repository for the code sensBVP. Its use is in
 calculating sensitivity coefficients of ignition delay time to rate
 coefficients. In sensBVP, this is carried out by transforming the
@@ -11,7 +13,8 @@ GSL are installed. Run make all, followed by make install in the source
 directory.
 
 After installing, the executable sensBVP can be executed as follows: 
-``` sensBVP -a <absolute tolerance> -r <relative tolerance> -f <BVP
+``` 
+sensBVP -a <absolute tolerance> -r <relative tolerance> -f <BVP
 residue tolerance> -T <initial temperature in K> -P <initial pressure in
 atm> -m <mechanism file (cti or xml)> -c <mole fraction composition> -t
 <integration time> -s <enable sensitivity analysis>
