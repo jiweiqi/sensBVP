@@ -17,13 +17,6 @@
 #include <sundials/sundials_types.h>   /* defs. of realtype, sunindextype      */
 #include <sundials/sundials_math.h>
 
-#include <kinsol/kinsol.h>             /* access to KINSOL func., consts. */
-//#include <kinsol/kinsol_impl.h>        /* access to KINSOL data structs */
-#include <sunmatrix/sunmatrix_band.h>  /* access to band SUNMatrix        */
-#include <kinsol/kinsol_direct.h>      /* access to KINDls interface      */
-#include <sunlinsol/sunlinsol_band.h>  /* access to band SUNLinearSolver  */
-//#include <sunlinsol/sunlinsol_lapackband.h>  /* access to band SUNLinearSolver  */
-
 #include <gsl/gsl_math.h>
 #include <gsl/gsl_spline.h>
 
@@ -47,6 +40,7 @@ static void sort(unsigned long n, double arr[], int ind[]);
 #define THREE RCONST(3.0)
 #define TEN   RCONST(10.0)
 #define BUFSIZE 1000
+#define EPSILON RCONST(0.1)
 
 /* In order to keep begin the index numbers from 1 instead of 0, we define
  * macros here. Also, we define macros to ease referencing various variables in
@@ -66,23 +60,12 @@ static void sort(unsigned long n, double arr[], int ind[]);
 #define Tdot(i)   NV_Ith_S(ydot,((i-1)*data->nvar)+data->nt)
 #define Ydot(i,k) NV_Ith_S(ydot,((i-1)*data->nvar)+data->ny+k-1)
 
-#define Ttemp(i)   NV_Ith_S(ytemp,((i-1)*(data->nvar+1))+data->nt)
-#define Ytemp(i,k) NV_Ith_S(ytemp,((i-1)*(data->nvar+1))+data->ny+k-1)
-#define tautemp(i) NV_Ith_S(ytemp,((i-1)*(data->nvar+1))+data->ntau)
-
-#define Tp(i)   NV_Ith_S(yp,((i-1)*(data->nvar+1))+data->nt)
-#define Yp(i,k) NV_Ith_S(yp,((i-1)*(data->nvar+1))+data->ny+k-1)
-#define taup(i) NV_Ith_S(yp,((i-1)*(data->nvar+1))+data->ntau)
-
 #define Pp(i)      NV_Ith_S(data->Pp,i-1)
 #define dPdtp(i)   NV_Ith_S(data->dPdtp,i-1)
 
 #define Tres(i)   NV_Ith_S(res,((i-1)*(data->nvar+1))+data->nt)
 #define Yres(i,k) NV_Ith_S(res,((i-1)*(data->nvar+1))+data->ny+k-1)
 #define taures(i) NV_Ith_S(res,((i-1)*(data->nvar+1))+data->ntau)
-
-#define tautmp1(i) NV_Ith_S(tmp1,((i-1)*(data->nvar+1))+data->ntau)
-#define tautmp2(i) NV_Ith_S(tmp2,((i-1)*(data->nvar+1))+data->ntau)
 
 #define wdot(i) wdot[i-1]
 #define enthalpy(i) enthalpy[i-1]
@@ -116,8 +99,6 @@ typedef struct {
 	bool writeSpeciesSensitivities;	//boolean to enable/disable writing
 				//of species sensitivities
 	bool IVPSuccess;
-	bool BVPSuccess;
-	bool sensSuccess;
 	int nsp,neq,npts,nvar;	//key quantities required in for loops:
 				//nsp-> no: of chemical species
 				//neq-> number of governing equations
@@ -133,7 +114,6 @@ typedef struct {
 				//computing difference quotients
 	realtype atol;
 	realtype rtol;
-	realtype ftol;
 	
   	realtype t1;		//Maximum time to run simulation
 	int nreac;		
@@ -141,6 +121,7 @@ typedef struct {
 	bool sensitivityAnalysis;// boolean to activate perturbations for
 				//sensitivity analysis
 	bool sens;		//if true, perform sensitivity analysis
+	bool secondOrder;	//if true, use second order finite differences
 	FILE *output;		//output file for temperature and species profiles
 	FILE *ignSensOutput;	//output file for ignition sensitivities
 	FILE *speSensOutput;	//output file for species sensitivities
@@ -159,9 +140,6 @@ static int setInitialProfile(UserData data, N_Vector y);
 /* Evaluate the residue for the IVP using this subroutine: */
 static int residue(realtype t, N_Vector y, N_Vector ydot, void *user_data);
 
-/* Evaluate the residue for the BVP using this subroutine: */
-static int residueKS(N_Vector yp, N_Vector res, void *user_data);
-
 static int parseInput(UserData data, int argc, char *argv[]);
 
 static int hunt(realtype x, realtype xx[], int n, int jguess);
@@ -169,9 +147,6 @@ static int hunt(realtype x, realtype xx[], int n, int jguess);
 static void polint(realtype *xdata, realtype *f, int n, realtype x,realtype *y, realtype *dy);
 
 static void lookupDpdt(UserData data, realtype t, realtype *P, realtype *dPdt);
-
-/* Subroutine to compute the Jacobian using numerical differencing: */
-static int kinDlsBandDQJac(N_Vector u, N_Vector fu, SUNMatrix Jac, UserData data, N_Vector scale, N_Vector tmp1, N_Vector tmp2);
 
 /* Subroutine that prints the column titles in the output file: */
 static void printInstructions();
@@ -184,18 +159,6 @@ static void printSensitivitiesHeader(UserData data);
  * in the UserData structure: */
 static void printOutput(realtype t, N_Vector y, UserData data);
 
-/* Subroutine that prints the output of the BVP into the output file contained
- * in the UserData structure: */
-//static void printOutputKS(N_Vector yp, UserData data);
-
-/* Subroutine that prints the residue of the BVP into the output file contained
- * in the UserData structure: */
-//static void printResidueKS(N_Vector res, UserData data);
-
-/* Subroutine that prints the species sensitivities into the output file
- * (speSensOutput) contained in the UserData structure: */
-static void printSpeciesSensitivities(int index, N_Vector yp, N_Vector res, UserData data);
-
 /* Subroutine that prints the sensitivities into the output file (ignSensOutput)
  * contained in the UserData structure: */
 static void printIgnSensitivities(realtype sensCoeffs[], int indices[], UserData data);
@@ -205,16 +168,12 @@ static int parsedPdt(UserData data);
 /* Print solver statistics for the IVP: */
 static void PrintFinalStats(void *cvode_mem);
 
-/* Print solver statistics for the BVP: */
-static void PrintFinalStatsKS(void *kmem);
-
 /* Subroutine that reports failure if memory hasn't been successfully allocated
  * to various objects: */
 static int check_flag(void *flagvalue, const char *funcname, int opt);
 
 int main(int argc, char *argv[])
 {
-
 	clock_t start, end;
      	double cpu_time_used;
      	start = clock();
@@ -228,17 +187,6 @@ int main(int argc, char *argv[])
   	data = (UserData) malloc(sizeof *data);
 	ier=parseInput(data,argc,argv);
 	if(ier==-1)return(-1);
-
-	/* Set the maximum number of time-steps that will be used in the BVP
-	 * formulation of the problem: */
-	int nout=50000;
-
-	/* Create a temporary solution array to save the results of the IVP for
-	 * use in the BVP:*/
-  	N_Vector ytemp;
-	data->npts=nout;
-	data->KSneq=(data->nvar+1)*data->npts;
-	ytemp=N_VNew_Serial(data->KSneq);
 
 	{
 		/* Solver Memory:*/
@@ -310,42 +258,18 @@ int main(int argc, char *argv[])
       		ier = CVDlsSetJacFn(mem, NULL);
       		ier=check_flag(&ier, "CVDlsSetJacFn", 1);
 		
-		/*Save the initial values in the temporary solution vector:*/
-		Ttemp(1)=T(1);
-		for(int k=1;k<=data->nsp;k++){
-			Ytemp(1,k)=Y(1,k);
-		}
-		tautemp(1)=tret;
-
 		/*Begin IVP solution; Save solutions in the temporary solution vector;
 		 * stop problem when the temperature reaches a certain value (like 400
 		 * K) corresponding to the time for ignition :*/
 		int i=1;
-		bool BVPCutOff=false;
-		int skip=10;
-		int count=0;
+		bool delayFound=false;
 		while (tret<=data->t1) {
-			if(i<data->npts){
-				if(!BVPCutOff){
-					Ttemp(i+1)=T(1);
-					for(int k=1;k<=data->nsp;k++){
-						Ytemp(i+1,k)=Y(1,k);
-					}
-					tautemp(i+1)=tret;
-				}
-			}
-			else{
-				printf("Need more points!\n");
-				printf("Hard-coded npts=%d not enough!\n",data->npts);
-				data->IVPSuccess=false;
-				break;
-			}
-			if(T(1)>=data->TIgn && !BVPCutOff){
+			if(T(1)>=data->TIgn && !delayFound){
 				printf("Ignition Delay: %15.6es\n", tret);
-				BVPCutOff=true;
+				data->tauIgn=tret;	//Save the ignition delay time
+				delayFound=true;
 			}
   			ier = CVode(mem, data->t1, y, &tret, CV_ONE_STEP);
-
   			if(check_flag(&ier, "CVode", 1)) {
 				data->IVPSuccess=false;
 				break;
@@ -353,293 +277,113 @@ int main(int argc, char *argv[])
 			else{
 				data->IVPSuccess=true;
 			}
-
 			printOutput(tret,y,data);
-
-			count++;
-
-			if(tret>1e-06 && !BVPCutOff && count%skip==0){
-				i++;
-				count=0;
-			}
-
 		}
 
-		data->npts=i;
-		data->KSneq=(data->nvar+1)*data->npts;
+		if(data->IVPSuccess && data->sens){
+			/*Enable sensitivity analysis:*/
+			data->sensitivityAnalysis=true;
+			data->rel=EPSILON;
+			realtype oneOverRel=ONE/(data->rel);
 
-  		/* Print remaining counters and free memory. */
-		PrintFinalStats(mem);
-  		CVodeFree(&mem);
-  		N_VDestroy_Serial(y);
-	}
-	
-	/*Create a solution vector yp, dimensioned such that the maximum no: of
-	 * grid points associated with it is the no: of time-steps (i) used
-	 * above. Fill in its values using the temporary solution vector. */
-  	N_Vector yp;
-	if(data->IVPSuccess){
-		yp=N_VNew_Serial(data->KSneq);
-		for(int j=1;j<=data->npts;j++){
-			Tp(j)=Ttemp(j);
-			for(int k=1;k<=data->nsp;k++){
-				if(fabs(Ytemp(j,k))>1e-16){
-					Yp(j,k)=Ytemp(j,k);
+			/*Create an array to store the logarithmic sensitivity
+			 * coefficients:*/
+			realtype sensCoeffs[data->nreac];
+
+			/*Create an array to store the indices of the reactions (needed
+			 * for sorting the sensitivity coefficients):*/
+			int indices[data->nreac];
+			double tauIgnPerturbedForward=0.0e0;
+			double tauIgnPerturbedBackward=0.0e0;
+			
+			for(int j=0;j<data->nreac;j++){
+
+				/*Save the index of the reaction whose collision
+				 * frequency (A in the Arrhenius law k=A*exp(-Eₐ/RT))
+				 * is to be perturbed:*/ 
+				data->pert_index=j;	
+
+				/*Perturb forward:*/
+				data->rel=EPSILON;
+				/*Set the initial values:*/
+				setInitialProfile(data, y);
+
+				/* Initialize the solver object by connecting it to the solution vector
+				 * y: */
+  				ier = CVodeReInit(mem, t0, y);
+  				ier=check_flag(&ier, "CVodeReInit", 1);
+				
+				/*Rerun the ignition delay problem!*/
+				printf("Solving forward perturbed problem %d:\n",j);
+				tret=0.0e0;
+				delayFound=false;
+				while (tret<=data->t1) {
+					if(T(1)>=data->TIgn && !delayFound){
+						printf("\tIgnition Delay(forward): %15.6es\n", tret);
+						tauIgnPerturbedForward=tret;	//Save the ignition delay time
+						delayFound=true;
+						/*No point continuing solution*/
+						break;
+					}
+  					ier = CVode(mem, data->t1, y, &tret, CV_ONE_STEP);
+  					if(check_flag(&ier, "CVode", 1)) {
+						data->IVPSuccess=false;
+						break;
+					}
+					else{
+						data->IVPSuccess=true;
+					}
+					//printOutput(tret,y,data);
 				}
-				else{
-					Yp(j,k)=ZERO;
+				if(!delayFound)tauIgnPerturbedForward=1e+99;
+				
+				if(data->secondOrder){
+					/*Perturb backward:*/
+					data->rel=-EPSILON;
+					/*Set the initial values:*/
+					setInitialProfile(data, y);
+
+					/* Initialize the solver object by connecting it to the solution vector
+					 * y: */
+  					ier = CVodeReInit(mem, t0, y);
+  					ier=check_flag(&ier, "CVodeReInit", 1);
+					
+					/*Rerun the ignition delay problem!*/
+					printf("Solving backward perturbed problem %d:\n",j);
+					tret=0.0e0;
+					delayFound=false;
+					while (tret<=data->t1) {
+						if(T(1)>=data->TIgn && !delayFound){
+							printf("\tIgnition Delay(backward): %15.6es\n", tret);
+							tauIgnPerturbedBackward=tret;	//Save the ignition delay time
+							delayFound=true;
+							/*No point continuing solution*/
+							break;
+						}
+  						ier = CVode(mem, data->t1, y, &tret, CV_ONE_STEP);
+  						if(check_flag(&ier, "CVode", 1)) {
+							data->IVPSuccess=false;
+							break;
+						}
+						else{
+							data->IVPSuccess=true;
+						}
+						//printOutput(tret,y,data);
+					}
+					if(!delayFound)tauIgnPerturbedBackward=1e+99;
+
+					/*Take the finite difference quotient as an
+					 * approximation to the logarithmic sensitivity
+					 * coefficient:*/
+					sensCoeffs[j]=oneOverRel*(tauIgnPerturbedForward-tauIgnPerturbedBackward)/(2.0e0*data->tauIgn);
+				}else{
+					sensCoeffs[j]=oneOverRel*(tauIgnPerturbedForward-data->tauIgn)/(data->tauIgn);
 				}
-			}
-			taup(j)=tautemp(j);
-		}
 
-		data->tauIgn=taup(data->npts);	//Save the ignition delay time
-		data->TIgn=Tp(data->npts);	//Save the temperature corresponding to
-						//the ignition delay
-		/* Create a grid (in time) to be used in the solution of the BVP: */
-  		data->x = N_VNew_Serial(data->npts);
-  		if(check_flag((void *)data->x, "N_VNew_Serial", 0)) return(1);
-
-		if(data->imposedPdt){
-  			data->Pp    = N_VNew_Serial(data->npts);
-  			if(check_flag((void *)data->Pp, "N_VNew_Serial", 0)) return(1);
-  			data->dPdtp = N_VNew_Serial(data->npts);
-  			if(check_flag((void *)data->dPdtp, "N_VNew_Serial", 0)) return(1);
-		}
-
-		realtype P,dPdt;
-		for (int j = 1; j <=data->npts; j++) {
-			if(data->imposedPdt){	
-				//P=dPdt=ZERO;
-				lookupDpdt(data, taup(j), &P, &dPdt);
-				Pp(j)=P*Cantera::OneAtm;
-				dPdtp(j)=dPdt*Cantera::OneAtm;
-				//printf("%15.6e\t%15.6e\n",Pp(j),dPdtp(j));
-			}
-			x(j)=taup(j)/data->tauIgn;
-			taup(j)=data->tauIgn;
-		}
-		if(data->tArray!=NULL){
-  			N_VDestroy_Serial(data->tArray);
-		}
-		if(data->PArray!=NULL){
-  			N_VDestroy_Serial(data->PArray);
-		}
-		if(data->dPdtArray!=NULL){
-  			N_VDestroy_Serial(data->dPdtArray);
-		}
-		//printOutputKS(yp,data);
-	}
-
-  	N_VDestroy_Serial(ytemp);	//Destroy the temporary solution vector
-	printf("No: of time-steps: %d\n",data->npts);
-	
-	/********************************************************/
-
-	/*Begin solution of the BVP here:*/
-	if(data->IVPSuccess && data->sens){
-		/*Create a KINSOL solver object for the solution of the BVP:*/
-		/* Solver Memory:*/
-  		void *mem; mem = NULL;
-  		mem = KINCreate();
-  		//if (check_flag((void *)mem, "KINCreate", 0)) return(1);
-
-		/*Associate the user data with the solver object: */
-  		ier = KINSetUserData(mem, data);
-  		ier=check_flag(&ier, "KINSetUserData", 1);
-
-		/* Initialize the solver object by connecting it to the solution vector
-		 * yp and the residue "residueKS": */
-  		ier = KINInit(mem, residueKS, yp);
-  		ier = check_flag(&ier, "KINInit", 1);
-
-  		/* Specify stopping tolerance based on residual: */
-  		ier = KINSetFuncNormTol(mem, data->ftol);
-  		ier = check_flag(&ier, "KINSetFuncNormTol", 1);
-		
-		/* Create banded SUNMatrix for use in linear solves; bandwidths are
-		 * dictated by the dependence of the solution at a given time on one
-		 * time-step ahead and one time-step behind:*/
-		SUNMatrix J;
-		int mu,ml;
-		mu = data->nvar+2; ml = data->nvar+2;
-  		J = SUNBandMatrix(data->KSneq, mu, ml, mu+ml);
-  		ier = check_flag((void *)J, "SUNBandMatrix", 0);
-
-      		/* Create dense SUNLinearSolver object for use by KINSOL: */
-  		SUNLinearSolver LSK;
-  		LSK = SUNBandLinearSolver(yp, J);
-  		ier = check_flag((void *)LSK, "SUNBandLinearSolver", 0);
-
-		/* Call KINDlsSetLinearSolver to attach the matrix and linear solver to
-		 * KINSOL: */
-  		ier = KINDlsSetLinearSolver(mem, LSK, J);
-  		ier = check_flag(&ier, "KINDlsSetLinearSolver", 1);
-
-  		/* No scaling used: */
-		N_Vector scale;
-		scale=NULL;
-  		scale = N_VNew_Serial(data->KSneq);
-  		//ier = check_flag((void *)scale, "N_VNew_Serial", 0);
-  		N_VConst_Serial(ONE,scale);
-
-  		/* Force a Jacobian re-evaluation every mset iterations: */
-  		int mset = 100;
-  		ier = KINSetMaxSetupCalls(mem, mset);
-  		//ier = check_flag(&ier, "KINSetMaxSetupCalls", 1);
-
-  		/* Every msubset iterations, test if a Jacobian evaluation
-  		   is necessary: */
-  		int msubset = 1;
-  		ier = KINSetMaxSubSetupCalls(mem, msubset);
-  		//ier = check_flag(&ier, "KINSetMaxSubSetupCalls", 1);
-
-		ier=KINSetPrintLevel(mem,2);
-
-  		/* Solve the BVP! */
-  		ier = KINSol(mem,     /* KINSol memory block */
-  		             yp,      /* initial guess on input; solution vector */
-  		             KIN_NONE,//KIN_LINESEARCH,/* global strategy choice */
-  		             scale,   /* scaling vector, for the variable cc */
-  		             scale);  /* scaling vector for function values fval */
-
-  		if (check_flag(&ier, "KINSol", 1)){
-			data->BVPSuccess=false;
-		}else{
-			data->BVPSuccess=true;
-			/* Get scaled norm of the system function */
-			ier = KINGetFuncNorm(mem, &data->ftol);
-			//ier = check_flag(&ier, "KINGetfuncNorm", 1);
-			printf("\nComputed solution (||F|| = %g):\n\n",data->ftol);
-			printf("KinSOL Ignition Delay: %15.6es\n", taup(1));
-		}
-  		//ier=check_flag(&ier, "KINSol", 1);
-
-		//printOutputKS(yp,data);
-		fclose(data->output);
-		PrintFinalStatsKS(mem);
-  		KINFree(&mem);
-  		N_VDestroy_Serial(scale);
-	}
-
-	/********************************************************/
-	/*Begin sensitivity analysis here:*/
-	if(data->BVPSuccess){
-		/* Create banded SUNMatrix for use in linear solves; bandwidths
-		 * are dictated by the dependence of the solution at a given
-		 * time on one time-step ahead and one time-step behind:*/
-		SUNMatrix J;
-		int mu,ml;
-		mu = data->nvar+1; ml = data->nvar+1;
-  		J = SUNBandMatrix(data->KSneq, mu, ml, mu+ml);
-  		ier = check_flag((void *)J, "SUNBandMatrix", 0);
-
-		/*Create a residue vector and two temporary vectors:*/
-  		N_Vector res,tmp1,tmp2, scale;
-		res=N_VNew_Serial(data->KSneq);
-		tmp1=N_VNew_Serial(data->KSneq);
-		tmp2=N_VNew_Serial(data->KSneq);
-  		scale = N_VNew_Serial(data->KSneq);
-  		N_VConst_Serial(ONE,scale);
-
-		/*Evaluate the residue using the solution computed by solving
-		 * the BVP above:*/
-		ier = residueKS(yp, res, data);
-		ier = check_flag(&ier, "residueKS", 1);
-		//printResidueKS(res,data);
-       
-       		/*Compute the Jacobian and store it in J:*/	
-		kinDlsBandDQJac(yp, res, J, data, scale, tmp1, tmp2);
-
-		/*Create a linear solver object for the banded system; in the
-		 * problem Ax=b, A is J and x is tmp2:*/
-  		SUNLinearSolver LS;
-  		LS = SUNBandLinearSolver(res, J);
-
-		/*Initialize the solver and perform an LU factorization by
-		 * running SUNLinSolSetup:*/
-		ier = SUNLinSolInitialize_Band(LS);
-		ier = check_flag(&ier, "SUNLinSolInitialize", 1);
-		ier = SUNLinSolSetup_Band(LS,J);
-		ier = check_flag(&ier, "SUNLinSolSetup", 1);
-
-		/*Create an array to store the logarithmic sensitivity
-		 * coefficients:*/
-		realtype sensCoeffs[data->nreac];
-
-		/*Create an array to store the indices of the reactions (needed
-		 * for sorting the sensitivity coefficients):*/
-		int indices[data->nreac];
-
-		/*The sensitivities are computed as follows:
-		 * For a system equations
-		 *    F(y;α)=0
-		 *    where F is the residue of the BVP
-		 *    	    y is the solution of the BVP
-		 *    	    α is a parameter 
-		 * => (∂F/∂y)(∂y/∂α)+(∂F/∂α) = 0
-		 * => (∂F/∂y)(∂y/∂α)=-(∂F/∂α)
-		 * Therefore, the sensitivity coefficient (∂y/∂α) can be
-		 * computed by solving a system Ax=b, where A=(∂F/∂y),
-		 * x=(∂y/∂α), and b=-(∂F/∂α)!*/
-
-		/*Run a loop over all the reactions: */
-		printf("\nRunning Sensitivity Analysis...\n");
-		/*Enable sensitivity analysis:*/
-		data->sensitivityAnalysis=true;
-		realtype oneOverRel=ONE/(data->rel);
-		for(int j=0;j<data->nreac;j++){
-
-			/*Save the index of the reaction whose collision
-			 * frequency (A in the Arrhenius law k=A*exp(-Eₐ/RT))
-			 * is to be perturbed:*/ 
-			data->pert_index=j;	
-
-			/*Compute the perturbed residue and store it in tmp1:*/
-			ier=residueKS(yp, tmp1, data);
-			ier=check_flag(&ier, "residueKS", 1);
-			//printResidueKS(tmp1,data);
-
-			/*Compute the difference F(α+Δα)-F(α) and store it in
-			 * tmp2:*/
-			N_VLinearSum(ONE,tmp1,-ONE,res,tmp2);
-
-			/*Divide the difference quotient by -Δα and store the
-			 * result in tmp1. This is the numerical approximation
-			 * to -(∂F/∂α):*/
-			N_VScale(-oneOverRel,tmp2,tmp1);
-
-			/*Solve the linear system (thankfully the LU
-			 * factiorization has already been carried out once and
-			 * for all above!) and store the solution in tmp2:*/
-			ier=SUNLinSolSolve_Band(LS,J,tmp2,tmp1,ZERO);
-			ier=check_flag(&ier, "SUNLinSolSolve", 1);
-
-			/*Divide the result by the ignition delay time to get
-			 * the logarithmic sensitivity coefficient and save it
-			 * in sensCoeffs:*/
-			sensCoeffs[j]=tautmp2(1)/taup(1);
-
-			if(sensCoeffs[j]!=sensCoeffs[j]){
-				printf("\nNaN! Quitting Program! Try different tolerances!\n");
-				data->sensSuccess=false;
-				break;
-			}else{
-				data->sensSuccess=true;
-				printf("Reaction %5d: %15.6e\n",j,sensCoeffs[j]);
+				indices[j]=j;
+				printf("\n");
 			}
 
-			/*Print out the temperature and species mass-fraction
-			 * sensitivities:*/
-			if(data->writeSpeciesSensitivities){
-				printSpeciesSensitivities(j, yp, tmp2, data);
-			}
-
-			/*Save the index of the reaction:*/
-			indices[j]=j;
-		}
-
-		if(data->sensSuccess){
 			/*Sort the sensitivities in ascending order. Note the advancing
 			 * of the beginning indices of the sensCoeffs and indices
 			 * arrays. This is due to the Numerical recipes convention for
@@ -650,19 +394,13 @@ int main(int argc, char *argv[])
 			printIgnSensitivities(sensCoeffs,indices,data);
 		}
 
-  		N_VDestroy_Serial(scale);
-  		N_VDestroy_Serial(res);
-  		N_VDestroy_Serial(tmp1);
-  		N_VDestroy_Serial(tmp2);
-		fclose(data->ignSensOutput);
-		fclose(data->speSensOutput);
+  		/* Print remaining counters and free memory. */
+		PrintFinalStats(mem);
+  		CVodeFree(&mem);
+  		N_VDestroy_Serial(y);
 	}
-	
+
 	/*Free memory and delete all the vectors and user data:*/
-	if(yp!=NULL){
-  		N_VDestroy_Serial(yp);
-		printf("BVP Solution Vector Deleted!\n");
-	}
 	if(data->Y0!=NULL){
   		N_VDestroy_Serial(data->Y0);
 		printf("Initial Mass fraction Vector Deleted!\n");
@@ -704,11 +442,9 @@ int main(int argc, char *argv[])
 		printf("User data structure deleted!\n");
 	}
 
-
  	end = clock();
      	cpu_time_used = ((double) (end - start)) / CLOCKS_PER_SEC;
 	printf("Elapsed cpu time: %15.6e s\n", cpu_time_used);
-
 	return(0);
 }
 
@@ -720,8 +456,6 @@ static int parseInput(UserData data, int argc, char *argv[]){
   	data->rtol = RCONST(1e-14);
 	/*Absolute tolerance for IVP:*/
   	data->atol = RCONST(1e-14);
-	/*Residue tolerance for BVP:*/
-	data->ftol = RCONST(1e-13);
 	/*Final Time:*/
 	data->t1   = RCONST(10.0);
 	/*Solve constant pressure problem:*/
@@ -730,7 +464,7 @@ static int parseInput(UserData data, int argc, char *argv[]){
 	data->imposedPdt=false;		
 	/*Disable writing species sensitivities:*/
 	data->writeSpeciesSensitivities=false;
-	/*Enable sensitivity analysis:*/
+	/*Disable sensitivity analysis:*/
 	data->sens=false;
 	/*Index to start with for pressure lookup (see hunt):*/
 	data->jguess=0;			
@@ -738,12 +472,13 @@ static int parseInput(UserData data, int argc, char *argv[]){
 	data->dPdt=ZERO;
 	/*Disable sensitivity analysis:*/
 	data->sensitivityAnalysis=false;
+	/*Use first order finite differences:*/
+	data->secondOrder=false;
 	/*Find the relative perturbation constant:*/
-	data->rel=SUNRsqrt(UNIT_ROUNDOFF);
+	//data->rel=SUNRsqrt(UNIT_ROUNDOFF);
+	data->rel=0.1;
 	/*Set flags that indicate success of various stages:*/
 	data->IVPSuccess=false;
-	data->BVPSuccess=false;
-	data->sensSuccess=false;
 	/*****************************************************/
 
 	int ier;
@@ -752,16 +487,13 @@ static int parseInput(UserData data, int argc, char *argv[]){
 	char comp[BUFSIZE+1];
 	bool enteredT0, enteredP, enteredMech, enteredComp;
 	enteredT0=enteredP=enteredMech=enteredComp=false;
-	while((opt=getopt(argc,argv,"a:r:f:T:P:m:c:t:vsd")) != -1){
+	while((opt=getopt(argc,argv,"a:r:T:P:m:c:t:vsd2")) != -1){
 		switch(opt){
 			case 'a':
 				data->atol=RCONST(atof(optarg));
 				break;
 			case 'r':
 				data->rtol=RCONST(atof(optarg));
-				break;
-			case 'f':
-				data->ftol=RCONST(atof(optarg));
 				break;
 			case 'T':
 				data->T0=RCONST(atof(optarg));
@@ -794,6 +526,9 @@ static int parseInput(UserData data, int argc, char *argv[]){
 				break;
 			case 'd':
 				data->imposedPdt=true;
+				break;
+			case '2':
+				data->secondOrder=true;
 				break;
 			default:
 				printInstructions();
@@ -831,7 +566,6 @@ static int parseInput(UserData data, int argc, char *argv[]){
 		printf("Required inputs provided:\n"); 
 		printf("\natol: %15.6e\n", data->atol); 
 		printf("\nrtol: %15.6e\n", data->rtol); 
-		printf("\nftol: %15.6e\n", data->ftol); 
 		printf("\nT0  : %15.6e K\n", data->T0); 
 		printf("\nP   : %15.6e Pa\n", data->P); 
 		printf("\nmech: %s\n", mech); 
@@ -891,7 +625,7 @@ static int setInitialProfile(UserData data, N_Vector y)
 	 * solution of the initial value problem:*/
   	N_VConst(ZERO, y);
 
-	T(1)=data->gas->temperature();
+	T(1)=data->T0;
 	for (int k = 1; k <=data->nsp; k++) {
   		Y(1,k)=Y0(k);
 	}
@@ -942,6 +676,13 @@ static int residue(realtype t, N_Vector y, N_Vector ydot, void *user_data)
 	realtype enthalpy[nsp];
 
     	try {
+		/*If sensitivity analysis has been enabled, perturb the collision
+		 * frequency by using cantera's setMultiplier function:*/
+		if(data->sensitivityAnalysis){
+			data->gas->setMultiplier(data->pert_index,ONE+data->rel);
+			//printf("%d\t%15.9e\n",data->pert_index,ONE+data->rel);
+		}
+
 		/*Set the gas conditions:*/
 		if(data->constantVolume){
   			data->gas->setMassFractions_NoNorm(&Y(1,1)); 	
@@ -985,137 +726,6 @@ static int residue(realtype t, N_Vector y, N_Vector ydot, void *user_data)
 		sum=sum*Cantera::GasConstant;
 		Tdot(1)=(data->dPdt-sum)/(rho*cp);
 
-    	} catch (Cantera::CanteraError& err) {
-	    printf("Error:\n");
-	    printf("%s\n",err.what());
-	    return(-1);
-    	}
-
-	return(0);
-}
-
-static int residueKS(N_Vector yp, N_Vector res, void *user_data)
-{
-
-	/*This is the sub-routine that computes the right hand side F(y) in the
-	 * problem F(y) = 0. Here the problem is specifically that of a
-	 * homogeneous isobaric batch reactor formulated as a boundary value
-	 * problem (BVP). The unknowns in this problem are T, Yᵢ, and τ.
-	 *
-	 * The energy conservation equation is 
-	 * 	  ∂T/∂x = (τ/ρcₚ)(dP/dt - ∑ ώᵢhᵢ)
-	 *
-	 * T has units of K
-	 * x is *unitless*
-	 * τ has units of time
-	 * hᵢ has units J/kmol, so we must multiply the enthalpy
-	 * defined above (getEnthalpy_RT) by T (K) and the gas constant
-	 * (J/kmol/K) to get the right units.
-	 * ρ has units of kg/m³
-	 * cₚ has units J/kg/K
-	 * ώᵢ has units of kmol/m³/s
-	 * dP/dt has units of Pa/s
-	 *
-	 * In the case of a constant volume problem, the energy conservation
-	 * equation can be re-written as
-	 * 	  ∂T/∂x = -(τ/ρcᵥ)∑ ώᵢeᵢ
-	 * eᵢ has units J/kmol
-	 * cᵥ has units J/kg/K
-	 *
-	 * The species conservation equation is
-	 * 	∂Yᵢ/∂x = τώᵢWᵢ/ρ
-	 *
-	 * Wᵢ has units of kg/kmol
-	 *
-	 * The equation (trivial) to maintain a banded structure in the linear
-	 * solver is 
-	 * 	∂τ/∂x = 0
-	 */
-	/*Assign data structure type to user_data:*/
-	UserData data;
-	data=(UserData)user_data;
-
-	/*Get no: of species:*/
-	int nsp=data->nsp;
-	
-	/*Create temporary arrays to store enthalpy (non-dimensional) and ώᵢ:*/
-	realtype wdot[nsp];
-	realtype enthalpy[nsp];
-	
-	/*Create temperorary variables to store grid spacing and summation
-	 * terms:*/
-	realtype dx;
-	realtype sum=ZERO;
-	data->dPdt=ZERO;
-
-    	try {
-		/*If sensitivity analysis has been enabled, perturb the collision
-		 * frequency by using cantera's setMultiplier function:*/
-		if(data->sensitivityAnalysis){
-			data->gas->setMultiplier(data->pert_index,ONE+data->rel);
-			//printf("%d\t%15.9e\n",data->pert_index,ONE+data->rel);
-		}
-
-		Tres(1)=Tp(1)-data->T0;
-		for(int k=1;k<=nsp;k++){
-			Yres(1,k)=Yp(1,k)-Y0(k);
-		}
-		taures(1)=taup(2)-taup(1);
-
-
-		for(int i=2;i<=data->npts;i++){
-
-			if(data->constantVolume){
-  				data->gas->setMassFractions_NoNorm(&Yp(i,1)); 	
-  				data->gas->setTemperature(Tp(i)); 	        
-  				data->gas->setDensity(data->rho0);
-			}
-			else if(data->imposedPdt){
-				//printf("%15.6e\t%15.6e\t%15.6e\n",x(i),Tp(i),Pp(i));
-  				data->gas->setMassFractions_NoNorm(&Yp(i,1)); 	
-  				data->gas->setTemperature(Tp(i)); 	        
-  				data->gas->setPressure(Pp(i));
-
-				data->dPdt=dPdtp(i);
-			}
-			else{
-  				data->gas->setMassFractions_NoNorm(&Yp(i,1)); 	
-  				data->gas->setTemperature(Tp(i)); 	        
-  				data->gas->setPressure(data->P);
-			}
-
-			realtype rho=data->gas->density();
-			realtype cp=data->gas->cp_mass();
-			data->gas->getNetProductionRates(wdot);
-			data->gas->getEnthalpy_RT(enthalpy);
-
-			if(data->constantVolume){
-				for(int k=1;k<=nsp;k++){
-					enthalpy(k)=enthalpy(k)-ONE;
-				}
-				cp=data->gas->cv_mass();
-			}
-
-			dx=x(i)-x(i-1);
-			sum=ZERO;
-
-			for(int k=1;k<=nsp;k++){
-				Yres(i,k)=(Yp(i,k)-Yp(i-1,k))/dx;
-				Yres(i,k)+=-taup(i)*wdot(k)*(data->gas->molecularWeight(k-1))/rho;
-				sum+=wdot(k)*enthalpy(k)*Tp(i);
-			}
-			sum=sum*Cantera::GasConstant;
-			Tres(i)=(Tp(i)-Tp(i-1))/dx;
-			Tres(i)+=taup(i)*(sum-data->dPdt)/(rho*cp);
-			if(i==data->npts){
-				taures(i)=Tp(i)-data->TIgn;
-			}
-			else{
-				taures(i)=taup(i+1)-taup(i);
-			}
-
-		}
-
 		/*If sensitivity analysis has been enabled, *un*perturb the collision
 		 * frequency:*/
 		if(data->sensitivityAnalysis){
@@ -1129,19 +739,24 @@ static int residueKS(N_Vector yp, N_Vector res, void *user_data)
     	}
 
 	return(0);
-
 }
 
 static void lookupDpdt(UserData data, realtype t, realtype *P, realtype *dPdt)
 {
 
-	realtype *dPdtData;
+	realtype *tData, *PData, *dPdtData;
+	tData = N_VGetArrayPointer_Serial(data->tArray);
+	PData = N_VGetArrayPointer_Serial(data->PArray);
 	dPdtData = N_VGetArrayPointer_Serial(data->dPdtArray);
+	int jguess=data->jguess;
+	int k=0;
+	int safel=0;
+	int nOrder=4;
 
+	realtype dy;
 	int npts=data->tArraySize;
 
 	if(t<=data->t1){
-	
 		*P=gsl_spline_eval(data->spline,t,data->acc);
 		*dPdt=gsl_spline_eval(data->splinedot,t,data->accdot);
 	}
@@ -1151,105 +766,6 @@ static void lookupDpdt(UserData data, realtype t, realtype *P, realtype *dPdt)
 	}
 }
 
-/*------------------------------------------------------------------
-  kinDlsBandDQJac
-
-  This routine generates a banded difference quotient approximation
-  to the Jacobian of F(u).  It assumes a SUNBandMatrix input stored
-  column-wise, and that elements within each column are contiguous.
-  This makes it possible to get the address of a column of J via the
-  function SUNBandMatrix_Column() and to write a simple for loop to
-  set each of the elements of a column in succession.
- 
-  NOTE: Any type of failure of the system function her leads to an
-        unrecoverable failure of the Jacobian function and thus of
-        the linear solver setup function, stopping KINSOL.
-  ------------------------------------------------------------------*/
-static int kinDlsBandDQJac(N_Vector u, N_Vector fu, SUNMatrix Jac,
-                    UserData data, N_Vector scale, N_Vector tmp1, N_Vector tmp2)
-{
-	realtype inc, inc_inv;
-	N_Vector futemp, utemp;
-	sunindextype group, i, j, width, ngroups, i1, i2;
-	sunindextype N, mupper, mlower;
-	realtype *col_j, *fu_data, *futemp_data, *u_data, *utemp_data, *uscale_data;
-	int retval = 0;
-	//KINDlsMem kindls_mem;
-	
-	//KINMem kin_mem;
-	//kin_mem = (KINMem) mem;
-	
-	///* access DlsMem interface structure */
-	//kindls_mem = (KINDlsMem) kin_mem->kin_lmem;
-	
-	/* access matrix dimensions */
-	N = SUNBandMatrix_Columns(Jac);
-	mupper = SUNBandMatrix_UpperBandwidth(Jac);
-	mlower = SUNBandMatrix_LowerBandwidth(Jac);
-	
-	/* Rename work vectors for use as temporary values of u and fu */
-	futemp = tmp1;
-	utemp  = tmp2;
-	
-	/* Obtain pointers to the data for ewt, fy, futemp, y, ytemp */
-	fu_data     = N_VGetArrayPointer(fu);
-	futemp_data = N_VGetArrayPointer(futemp);
-	u_data      = N_VGetArrayPointer(u);
-	//uscale_data = N_VGetArrayPointer(kin_mem->kin_uscale);
-	uscale_data = N_VGetArrayPointer(scale);
-	utemp_data  = N_VGetArrayPointer(utemp);
-	
-	/* Load utemp with u */
-	N_VScale(ONE, u, utemp);
-	
-	/* Set bandwidth and number of column groups for band differencing */
-	width   = mlower + mupper + 1;
-	ngroups = SUNMIN(width, N);
-	
-	//UserData data;
-	//data=(UserData) kin_mem->kin_user_data;
-	
-	for (group=1; group <= ngroups; group++) {
-	  
-	  /* Increment all utemp components in group */
-	  for(j=group-1; j < N; j+=width) {
-	    //inc = kin_mem->kin_sqrt_relfunc*SUNMAX(SUNRabs(u_data[j]),
-	    //                                       ONE/SUNRabs(uscale_data[j]));
-	    //inc = data->rel*SUNRabs(u_data[j]);
-	    inc = data->rel*SUNMAX(SUNRabs(u_data[j]),
-	                           ONE/SUNRabs(uscale_data[j]));
-	    utemp_data[j] += inc;
-	  }
-	
-	  /* Evaluate f with incremented u */
-	  //retval = kin_mem->kin_func(utemp, futemp, kin_mem->kin_user_data);
-	  retval=residueKS(utemp, futemp, data);
-	  if (retval != 0) return(retval); 
-	
-	  /* Restore utemp components, then form and load difference quotients */
-	  for (j=group-1; j < N; j+=width) {
-	    utemp_data[j] = u_data[j];
-	    col_j = SUNBandMatrix_Column(Jac, j);
-	    //inc = kin_mem->kin_sqrt_relfunc*SUNMAX(SUNRabs(u_data[j]),
-	    //                                       ONE/SUNRabs(uscale_data[j]));
-	    //inc = kin_mem->kin_sqrt_relfunc*SUNRabs(u_data[j]);
-	    //inc = data->rel*SUNRabs(u_data[j]);
-	    inc = data->rel*SUNMAX(SUNRabs(u_data[j]),
-	                           ONE/SUNRabs(uscale_data[j]));
-	    inc_inv = ONE/inc;
-	    i1 = SUNMAX(0, j-mupper);
-	    i2 = SUNMIN(j+mlower, N-1);
-	    for (i=i1; i <= i2; i++)
-	      SM_COLUMN_ELEMENT_B(col_j,i,j) = inc_inv * (futemp_data[i] - fu_data[i]);
-	  }
-	}
-	
-	///* Increment counter nfeDQ */
-	//kindls_mem->nfeDQ += ngroups;
-	
-	
-	return(0);
-}
 
 static int hunt(realtype x, realtype xx[], int n, int jguess)
 {
@@ -1433,7 +949,6 @@ static void printInstructions(){
 	printf("\nInputs either incomplete or wrong!\n");
 	printf("\n-a <absolute tolerance for IVP>\n");
 	printf("\n-r <relative tolerance for IVP>\n");
-	printf("\n-f <function tolerance for BVP>\n");
 	printf("\n-T <Initial Temperature in Kelvin>\n");
 	printf("\n-P <Initial Pressure in atm>\n");
 	printf("\n-m <mechanism file (cti or xml)>\n");
@@ -1443,6 +958,7 @@ static void printInstructions(){
 	printf("\n-s :Enables ignition delay sensitivity output\n");
 	printf("\n-S :Enables species mass fraction sensitivity output (works only with -s)\n");
 	printf("\n-d :Enables manual dPdt entryspecies sensitivity output\n");
+	printf("\n-2 :Enables 2nd order accurate finite differences\n");
 	printf("\nexample: <executable> ");
 	printf("-T 1200.0 -P 1.0 -m gri30.cti");
 	printf(" -c H2:1.0,N2:3.76,O2:1.0");
@@ -1494,65 +1010,18 @@ static void printOutput(realtype t, N_Vector y, UserData data)
 	fprintf((data->output), "\n");
 }
 
-
-//static void printOutputKS(N_Vector yp, UserData data)
-//{
-//	//printf("%d\n",data->npts);
-//	fprintf(data->output, "\n\n");
-//	for(int i=1;i<=data->npts;i++){
-//		fprintf((data->output), "%15.6e\t%15.6e\t%15.6e\t",x(i)*data->tauIgn,Tp(i),data->P);
-//		//printf("%15.6e\t%15.6e\n",x(i),Tp(i));
-//		for (int k = 1; k <=data->nsp; k++) {
-//			fprintf((data->output), "%15.6e\t",Yp(i,k));
-//		}
-//		fprintf(data->output, "\n");
-//	}
-//}
-
-static void printSpeciesSensitivities(int index, N_Vector yp, N_Vector res, UserData data)
-{
-	char buf[50];
-	std::string line;
-	line=data->gas->reactionString(index);
-	sprintf(buf,"%s",line.c_str());
-	fprintf((data->speSensOutput), "#%d: %38s\t\n", index, buf);
-	printSensitivitiesHeader(data);
-	for(int i=1;i<=data->npts;i++){
-		fprintf((data->speSensOutput), "%15.6e\t%15.6e\t",x(i)*taup(i),Tres(i)/Tp(i));
-		for (int k = 1; k <=data->nsp; k++) {
-			if(Yp(i,k)>=data->atol){
-				fprintf((data->speSensOutput), "%15.6e\t",Yres(i,k)/(Yp(i,k)+1e-31));
-			}
-			else{
-				fprintf((data->speSensOutput), "%15.6e\t",ZERO);
-			}
-		}
-		fprintf((data->speSensOutput), "\n");
-	}
-	fprintf((data->speSensOutput), "\n\n");
-}
-
-//static void printResidueKS(N_Vector res, UserData data)
-//{
-//	fprintf((data->output), "\n\n");
-//	for(int i=1;i<=data->npts;i++){
-//		fprintf((data->output), "%15.6e\t%15.6e\t",x(i),Tres(i));
-//		for (int k = 1; k <=data->nsp; k++) {
-//			fprintf((data->output), "%15.6e\t",Yres(i,k));
-//		}
-//		fprintf((data->output), "\n");
-//	}
-//}
-
 static void printIgnSensitivities(realtype sensCoeffs[], int indices[], UserData data)
 {
-	char buf[50];
+	char buf[100];
 	std::string line;
 	for(int j=0;j<data->nreac;j++){
 		line=data->gas->reactionString(indices[j]);
 		sprintf(buf,"%s",line.c_str());
 		fprintf((data->ignSensOutput), "%d\t\"%35s\"\t%15.6e\n",indices[j],buf,sensCoeffs[j]);
 	}
+	//for(int j=0;j<data->nreac;j++){
+	//	fprintf((data->ignSensOutput), "%d\t%15.6e\n",indices[j],sensCoeffs[j]);
+	//}
 }
 
 static int parsedPdt(UserData data){
@@ -1676,54 +1145,6 @@ static void PrintFinalStats(void *cvode_mem)
 	       nst, nfe, nsetups, nfeLS, nje);
 	printf("nni = %-6ld ncfn = %-6ld netf = %-6ld nge = %ld\n \n",
 		 nni, ncfn, netf, nge);
-}
-
-static void PrintFinalStatsKS(void *kmem)
-{
-	long int nni, nfe, nje, nfeD;
-	long int lenrw, leniw, lenrwB, leniwB;
-	long int nbcfails, nbacktr;
-	int flag;
-	
-	/* Main solver statistics */
-	
-	flag = KINGetNumNonlinSolvIters(kmem, &nni);
-	check_flag(&flag, "KINGetNumNonlinSolvIters", 1);
-	flag = KINGetNumFuncEvals(kmem, &nfe);
-	check_flag(&flag, "KINGetNumFuncEvals", 1);
-	
-	/* Linesearch statistics */
-	
-	flag = KINGetNumBetaCondFails(kmem, &nbcfails);
-	check_flag(&flag, "KINGetNumBetacondFails", 1);
-	flag = KINGetNumBacktrackOps(kmem, &nbacktr);
-	check_flag(&flag, "KINGetNumBacktrackOps", 1);
-	
-	/* Main solver workspace size */
-	
-	flag = KINGetWorkSpace(kmem, &lenrw, &leniw);
-	check_flag(&flag, "KINGetWorkSpace", 1);
-	
-	/* Band linear solver statistics */
-	
-	flag = KINDlsGetNumJacEvals(kmem, &nje);
-	check_flag(&flag, "KINDlsGetNumJacEvals", 1);
-	flag = KINDlsGetNumFuncEvals(kmem, &nfeD);
-	check_flag(&flag, "KINDlsGetNumFuncEvals", 1);
-	
-	/* Band linear solver workspace size */
-	
-	flag = KINDlsGetWorkSpace(kmem, &lenrwB, &leniwB);
-	check_flag(&flag, "KINDlsGetWorkSpace", 1);
-	
-	printf("\nFinal KINSOL Statistics:\n");
-	printf("nni      = %6ld    nfe     = %6ld \n", nni, nfe);
-	printf("nbcfails = %6ld    nbacktr = %6ld \n", nbcfails, nbacktr);
-	printf("nje      = %6ld    nfeB    = %6ld \n", nje, nfeD);
-	printf("\n");
-	printf("lenrw    = %6ld    leniw   = %6ld \n", lenrw, leniw);
-	printf("lenrwB   = %6ld    leniwB  = %6ld \n", lenrwB, leniwB);
-
 }
 
 static int check_flag(void *flagvalue, const char *funcname, int opt)
