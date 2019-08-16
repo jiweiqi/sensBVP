@@ -14,12 +14,19 @@ directory.
 
 After installing, the executable sensBVP can be executed as follows: 
 ``` 
-sensBVP -a <absolute tolerance> -r <relative tolerance> -f <BVP
-residue tolerance> -T <initial temperature in K> -P <initial pressure in
-atm> -m <mechanism file (cti or xml)> -c <mole fraction composition> -t
-<integration time> -s <enable sensitivity analysis>
+sensBVP -a <absolute tolerance> 
+	-r <relative tolerance> -f <BVP residue tolerance> 
+	-T <initial temperature in K> 
+	-P <initial pressure in atm> 
+	-m <mechanism file (cti or xml)> 
+	-c <mole fraction composition> 
+	-t <integration time> 
+	-s <enable sensitivity analysis>
 ```
 
-Execute sensBVP -h for all available options.
+Execute sensBVP -h for all available options. The time evolution of
+species mass fractions, temperature, and pressure can be found in
+"output.dat". The ignition delay sensitivities can be found in
+"ignitionSensitivities.dat".
 
 Try the cases in the examples directory.
