@@ -15,7 +15,8 @@ directory.
 After installing, the executable sensBVP can be executed as follows: 
 ``` 
 sensBVP -a <absolute tolerance> 
-	-r <relative tolerance> -f <BVP residue tolerance> 
+	-r <relative tolerance> 
+	-f <BVP residue tolerance> 
 	-T <initial temperature in K> 
 	-P <initial pressure in atm> 
 	-m <mechanism file (cti or xml)> 
