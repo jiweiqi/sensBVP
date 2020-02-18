@@ -117,6 +117,10 @@ typedef struct {
 	realtype T0;		//Initial Temperature (in K)
 	N_Vector Y0;		//Initial Mass Fractions
 	realtype rho0;		//initial density
+	realtype TIgnFac;	//factor that determines the ignition
+				//temperature: should be anywhere between 0 and 1 where 0 corresponds to the
+		     		//initial temperature and 1 corresponds to adiabatic flame
+		     		//temperature
 	realtype TIgn;		//Ignition Temperature (in K)
 	realtype tauIgn;	//Ignition delay time  (in s)
 	N_Vector x;		//The grid
@@ -158,6 +162,7 @@ typedef struct {
 	int pert_index;		//index of reaction whose rate is perturbed
 	bool sensitivityAnalysis;// boolean to activate perturbations for
 				//sensitivity analysis
+	bool sort;		//boolean to activate sorting
 	bool sens;		//if true, perform sensitivity analysis
 	FILE *output;		//output file for temperature and species profiles
 	FILE *ignSensOutput;	//output file for ignition sensitivities
@@ -293,7 +298,8 @@ int main(int argc, char *argv[])
 		printOutput(0.0e0,y,data);
 
   		/* Create a CVode solver object for solution of the IVP:  */
-  		mem = CVodeCreate(CV_BDF,CV_NEWTON);
+  		//mem = CVodeCreate(CV_BDF,CV_NEWTON);
+  		mem = CVodeCreate(CV_BDF);
   		ier=check_flag((void *)mem, "CVodeCreate", 0);
 		
 		/*Associate the user data with the solver object: */
@@ -481,7 +487,8 @@ int main(int argc, char *argv[])
 		SUNMatrix J;
 		int mu,ml;
 		mu = data->nvar+2; ml = data->nvar+2;
-  		J = SUNBandMatrix(data->KSneq, mu, ml, mu+ml);
+  		//J = SUNBandMatrix(data->KSneq, mu, ml, mu+ml);
+  		J = SUNBandMatrix(data->KSneq, mu, ml);
   		ier = check_flag((void *)J, "SUNBandMatrix", 0);
 
       		/* Create dense SUNLinearSolver object for use by KINSOL: */
@@ -549,7 +556,8 @@ int main(int argc, char *argv[])
 		SUNMatrix J;
 		int mu,ml;
 		mu = data->nvar+1; ml = data->nvar+1;
-  		J = SUNBandMatrix(data->KSneq, mu, ml, mu+ml);
+  		//J = SUNBandMatrix(data->KSneq, mu, ml, mu+ml);
+  		J = SUNBandMatrix(data->KSneq, mu, ml);
   		ier = check_flag((void *)J, "SUNBandMatrix", 0);
 
 		/*Create a residue vector and two temporary vectors:*/
@@ -658,14 +666,17 @@ int main(int argc, char *argv[])
 		}
 
 		if(data->sensSuccess){
-			/*Sort the sensitivities in ascending order. Note the advancing
-			 * of the beginning indices of the sensCoeffs and indices
-			 * arrays. This is due to the Numerical recipes convention for
-			 * array indexing used in sort subroutine:*/
-			//sort(data->nreac,sensCoeffs-1,indices-1);
 
-			/*Print out the sensitivities:*/
-			printIgnSensitivities(sensCoeffs,indices,data);
+		  /*Sort the sensitivities in ascending order. Note the advancing
+		 * of the beginning indices of the sensCoeffs and indices
+		 * arrays. This is due to the Numerical recipes convention for
+		 * array indexing used in sort subroutine:*/
+
+		  if(data->sort){
+			sort(data->nreac,sensCoeffs-1,indices-1);
+		  }
+		  /*Print out the sensitivities:*/
+		  printIgnSensitivities(sensCoeffs,indices,data);
 		}
 
   		N_VDestroy_Serial(scale);
@@ -762,6 +773,10 @@ static int parseInput(UserData data, int argc, char *argv[]){
 	data->IVPSuccess=false;
 	data->BVPSuccess=false;
 	data->sensSuccess=false;
+	/*TIgnFac:*/
+	data->TIgnFac=0.20;
+	/*Sorting*/
+	data->sort=sort;
 	/*****************************************************/
 
 	int ier;
@@ -770,7 +785,7 @@ static int parseInput(UserData data, int argc, char *argv[]){
 	char comp[BUFSIZE+1];
 	bool enteredT0, enteredP, enteredMech, enteredComp;
 	enteredT0=enteredP=enteredMech=enteredComp=false;
-	while((opt=getopt(argc,argv,"a:r:f:T:P:m:c:t:vsd")) != -1){
+	while((opt=getopt(argc,argv,"a:r:f:T:P:m:c:t:q:vsod")) != -1){
 		switch(opt){
 			case 'a':
 				data->atol=RCONST(atof(optarg));
@@ -810,8 +825,14 @@ static int parseInput(UserData data, int argc, char *argv[]){
 			case 's':
 				data->sens=true;
 				break;
+			case 'o':
+				data->sort=true;
+				break;
 			case 'd':
 				data->imposedPdt=true;
+				break;
+			case 'q':
+				data->TIgnFac=RCONST(atof(optarg));
 				break;
 			default:
 				printInstructions();
@@ -887,7 +908,7 @@ static int parseInput(UserData data, int argc, char *argv[]){
 		data->gas->equilibrate("HP");
 	}
 	data->TIgn=data->T0+(data->gas->temperature()
-			    -data->T0)*RCONST(0.20);
+			    -data->T0)*data->TIgnFac;
 	printf("Ignition Temperature: %15.6e K\n",data->TIgn);
 	data->gas->setState_TPX(data->T0,
 				data->P,
@@ -1461,6 +1482,8 @@ static void printInstructions(){
 	printf("\n-s :Enables ignition delay sensitivity output\n");
 	printf("\n-S :Enables species mass fraction sensitivity output (works only with -s)\n");
 	printf("\n-d :Enables manual dPdt entryspecies sensitivity output\n");
+	printf("\n-o :Enables sorting of ignition delay sensitivity output\n");
+	printf("\n-q :factor that determines ignition temperature (default: 0.2)\n");
 	printf("\nexample: <executable> ");
 	printf("-T 1200.0 -P 1.0 -m gri30.cti");
 	printf(" -c H2:1.0,N2:3.76,O2:1.0");

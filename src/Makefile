@@ -1,7 +1,7 @@
 compiler	=g++
 CANTERA_DIR	=/opt/scientific/cantera-2.4_gnu_blas
-CVODE_DIR	=/opt/scientific/sundials-3.1.1_gnu_blas
-KINSOL_DIR	=/opt/scientific/sundials-3.1.1_gnu_blas
+CVODE_DIR	=/opt/scientific/sundials-5.1.0
+KINSOL_DIR	=/opt/scientific/sundials-5.1.0
 BVPEXE		=sensBVP
 BRUTEEXE	=sensBrute
 DESTDIR		=~/bin

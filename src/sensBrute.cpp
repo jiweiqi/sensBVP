@@ -242,7 +242,8 @@ int main(int argc, char *argv[])
 		printOutput(0.0e0,y,data);
 
   		/* Create a CVode solver object for solution of the IVP:  */
-  		mem = CVodeCreate(CV_BDF,CV_NEWTON);
+  		//mem = CVodeCreate(CV_BDF,CV_NEWTON);
+  		mem = CVodeCreate(CV_BDF);
   		ier=check_flag((void *)mem, "CVodeCreate", 0);
 		
 		/*Associate the user data with the solver object: */
