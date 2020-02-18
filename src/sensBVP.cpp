@@ -776,7 +776,7 @@ static int parseInput(UserData data, int argc, char *argv[]){
 	/*TIgnFac:*/
 	data->TIgnFac=0.20;
 	/*Sorting*/
-	data->sort=sort;
+	data->sort=false;
 	/*****************************************************/
 
 	int ier;
